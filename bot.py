@@ -25,7 +25,6 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("
 mongo = MongoClient(MONGO_URI)
 db = mongo["yt_cookie_bot"]
 
-# Collections
 users_col = db["users"]
 premium_col = db["premium"]
 plans_col = db["plans"]
@@ -75,8 +74,7 @@ async def start_command(client, message):
     
     if not is_authorized(user_id):
         await message.reply(
-            "❌ *Unauthorized Access*\n\nYou are not authorized to use this bot.\nContact owner for access.",
-            parse_mode="MarkdownV2"
+            "❌ *Unauthorized Access*\n\nYou are not authorized to use this bot.\nContact owner for access."
         )
         return
     
@@ -112,8 +110,7 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             if daily_limit >= 1:
                 await callback_query.message.edit_text(
                     "⚠️ *Daily Limit Reached*\n\nFree users: 1 extraction per day\nUpgrade to premium for unlimited access!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade", callback_data="plans")]]),
-                    parse_mode="MarkdownV2"
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade", callback_data="plans")]])
                 )
                 return
         
@@ -123,8 +120,7 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             upsert=True
         )
         await callback_query.message.edit_text(
-            "🔐 *Login Process Started*\n\nPlease send your **Gmail address**:\n\nExample: `example@gmail.com`\n\n⚠️ Your credentials are encrypted and never stored.",
-            parse_mode="MarkdownV2"
+            "🔐 *Login Process Started*\n\nPlease send your **Gmail address**:\n\nExample: `example@gmail.com`\n\n⚠️ Your credentials are encrypted and never stored."
         )
         
     elif data == "plans":
@@ -141,7 +137,7 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             keyboard.append([InlineKeyboardButton(f"Buy {plan['name']} - ₹{plan['price']}", callback_data=f"buy_{plan['id']}")])
         keyboard.append([InlineKeyboardButton("🏠 Back", callback_data="home")])
         
-        await callback_query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="MarkdownV2")
+        await callback_query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
         
     elif data.startswith("buy_"):
         plan_id = data.split("_")[1]
@@ -151,14 +147,25 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             qr = generate_upi_qr(upi['upi_id'], plan['price'])
             await callback_query.message.reply_photo(
                 photo=qr,
-                caption=f"💸 *Payment Details*\n\nPlan: {plan['name']}\nAmount: ₹{plan['price']}\nUPI: `{upi['upi_id']}`\n\nSend screenshot after payment to /confirm {plan_id}",
-                parse_mode="MarkdownV2"
+                caption=f"💸 *Payment Details*\n\nPlan: {plan['name']}\nAmount: ₹{plan['price']}\nUPI: `{upi['upi_id']}`\n\nSend screenshot after payment to /confirm {plan_id}"
             )
     
     elif data == "help":
         await callback_query.message.edit_text(
-            "📖 *How to use:*\n\n1️⃣ Click 'Get Cookies'\n2️⃣ Send your Gmail address\n3️⃣ Send your password\n4️⃣ If 2FA enabled, send verification code\n5️⃣ Receive cookies.txt file\n\n🔒 *Privacy:*\n- Credentials are never stored\n- Session ends after extraction\n- Cookies are sent only to you\n\n💎 *Premium Benefits:*\n- Unlimited extractions\n- Priority processing\n- 24/7 support",
-            parse_mode="MarkdownV2"
+            "📖 *How to use:*\n\n"
+            "1️⃣ Click 'Get Cookies'\n"
+            "2️⃣ Send your Gmail address\n"
+            "3️⃣ Send your password\n"
+            "4️⃣ If 2FA enabled, send verification code\n"
+            "5️⃣ Receive cookies.txt file\n\n"
+            "🔒 *Privacy:*\n"
+            "- Credentials are never stored\n"
+            "- Session ends after extraction\n"
+            "- Cookies are sent only to you\n\n"
+            "💎 *Premium Benefits:*\n"
+            "- Unlimited extractions\n"
+            "- Priority processing\n"
+            "- 24/7 support"
         )
     
     elif data == "home":
@@ -191,7 +198,7 @@ async def handle_login_input(client, message):
             {"user_id": user_id},
             {"$set": {"state": "awaiting_password", "email": email, "extractor": extractor}}
         )
-        await message.reply("✅ Email received!\n\nNow send your *password*:\n\n⚠️ Password is hidden and won't be stored.", parse_mode="MarkdownV2")
+        await message.reply("✅ Email received!\n\nNow send your *password*:\n\n⚠️ Password is hidden and won't be stored.")
     
     elif state == "awaiting_password":
         password = message.text.strip()
@@ -208,8 +215,7 @@ async def handle_login_input(client, message):
                 {"$set": {"state": "awaiting_2fa", "extractor": extractor}}
             )
             await status_msg.edit_text(
-                "🔐 *Two-Factor Authentication Required*\n\nPlease send your 6-digit Google Authenticator code:",
-                parse_mode="MarkdownV2"
+                "🔐 *Two-Factor Authentication Required*\n\nPlease send your 6-digit Google Authenticator code:"
             )
         elif result.get("status") == "success":
             cookies = result.get("cookies")
@@ -217,8 +223,7 @@ async def handle_login_input(client, message):
             await message.reply_document(
                 document=BytesIO(cookies.encode()),
                 file_name="youtube_cookies.txt",
-                caption="✅ *Success!* Here are your YouTube cookies.\n\n📌 *Usage:*\n`yt-dlp --cookies youtube_cookies.txt <video_url>`\n\n🔒 Session closed. Your credentials are not stored.",
-                parse_mode="MarkdownV2"
+                caption="✅ *Success!* Here are your YouTube cookies.\n\n📌 *Usage:*\n`yt-dlp --cookies youtube_cookies.txt <video_url>`\n\n🔒 Session closed. Your credentials are not stored."
             )
             sessions_col.delete_one({"user_id": user_id})
             
@@ -247,8 +252,7 @@ async def handle_login_input(client, message):
             await message.reply_document(
                 document=BytesIO(cookies.encode()),
                 file_name="youtube_cookies.txt",
-                caption="✅ *Success!* 2FA verified. Here are your cookies.\n\n🔒 Session closed. Credentials not stored.",
-                parse_mode="MarkdownV2"
+                caption="✅ *Success!* 2FA verified. Here are your cookies.\n\n🔒 Session closed. Credentials not stored."
             )
             sessions_col.delete_one({"user_id": user_id})
             
@@ -380,8 +384,7 @@ async def bot_stats(client, message):
     active_sessions = sessions_col.count_documents({})
     
     await message.reply(
-        f"📊 *Bot Statistics*\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n🔄 Active Sessions: {active_sessions}\n💰 Plans Available: {plans_col.count_documents({})}\n💳 UPI Configured: {upi_col.find_one()['upi_id'] if upi_col.find_one() else 'None'}",
-        parse_mode="MarkdownV2"
+        f"📊 *Bot Statistics*\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n🔄 Active Sessions: {active_sessions}\n💰 Plans Available: {plans_col.count_documents({})}\n💳 UPI Configured: {upi_col.find_one()['upi_id'] if upi_col.find_one() else 'None'}"
     )
 
 # ---------- FLASK APP FOR PORT BINDING (RENDER) ----------
@@ -401,12 +404,10 @@ def run_flask():
 
 # ---------- RUN ----------
 if __name__ == "__main__":
-    # Start Flask in background thread for Render port binding
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
-    # Start Telegram bot
-    print("🤖 Bot Started with 2FA Support and Port Binding!")
+    print("🤖 Bot Started Successfully!")
     print(f"Owner ID: {OWNER_ID}")
     print(f"Admins: {ADMIN_IDS}")
     print(f"Port: {os.environ.get('PORT', 8080)}")
