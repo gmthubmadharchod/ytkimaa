@@ -536,3 +536,124 @@ async def add_user_cmd(client, message):
     except:
         await message.reply("❌ Usage: `/adduser 123456789`")
 
+@app.on_message(filters.command("removeuser") & filters.user(OWNER_ID))
+async def remove_user_cmd(client, message):
+    try:
+        user_id = int(message.text.split()[1])
+        users_col.delete_one({"_id": user_id})
+        premium_col.delete_one({"_id": user_id})
+        await message.reply(f"✅ User `{user_id}` removed")
+        
+        await client.send_message(
+            LOG_CHANNEL_ID,
+            f"➖ **User Removed**\n\nUser ID: `{user_id}`\nRemoved by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except:
+        await message.reply("❌ Usage: `/removeuser 123456789`")
+
+@app.on_message(filters.command("activate") & filters.user(OWNER_ID))
+async def activate_premium_cmd(client, message):
+    try:
+        parts = message.text.split()
+        user_id = int(parts[1])
+        days = int(parts[2]) if len(parts) > 2 else 30
+        
+        expiry = datetime.now() + timedelta(days=days)
+        premium_col.update_one(
+            {"_id": user_id},
+            {"$set": {"expiry": expiry.timestamp(), "activated_at": datetime.now()}},
+            upsert=True
+        )
+        await message.reply(f"✅ Premium activated for `{user_id}` for {days} days")
+        await client.send_message(user_id, f"🎉 **Premium Activated!**\n\nYour premium account is active for {days} days.\nEnjoy unlimited cookie extractions!")
+        
+        await client.send_message(
+            LOG_CHANNEL_ID,
+            f"⭐ **Premium Activated**\n\nUser: `{user_id}`\nDays: {days}\nExpiry: {expiry.strftime('%Y-%m-%d %H:%M:%S')}\nActivated by: Owner"
+        )
+    except:
+        await message.reply("❌ Usage: `/activate user_id days`\nExample: `/activate 123456789 30`")
+
+@app.on_message(filters.command("setupi") & filters.user(OWNER_ID))
+async def set_upi_cmd(client, message):
+    try:
+        upi_id = message.text.split(" ", 1)[1]
+        upi_col.update_one({}, {"$set": {"upi_id": upi_id}}, upsert=True)
+        await message.reply(f"✅ UPI ID updated to `{upi_id}`")
+        
+        await client.send_message(
+            LOG_CHANNEL_ID,
+            f"💳 **UPI Updated**\n\nNew UPI: `{upi_id}`\nUpdated by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except:
+        await message.reply("❌ Usage: `/setupi your_upi_id`")
+
+@app.on_message(filters.command("logs") & filters.user(OWNER_ID))
+async def get_logs_cmd(client, message):
+    """Get recent logs from database"""
+    recent_logs = list(logs_col.find().sort("timestamp", -1).limit(20))
+    
+    if not recent_logs:
+        await message.reply("📝 No logs found.")
+        return
+    
+    msg = "📝 **Recent Activity Logs**\n\n"
+    for log in recent_logs:
+        time = log['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+        msg += f"🕒 `{time}`\n"
+        msg += f"👤 User: `{log['user_id']}`\n"
+        msg += f"📧 Email: `{log['email']}`\n"
+        msg += f"✅ Status: {log['status']}\n"
+        msg += f"📊 Cookies Size: {log['cookies_length']} bytes\n"
+        msg += f"⭐ Premium: {'Yes' if log.get('premium') else 'No'}\n"
+        msg += "─" * 20 + "\n"
+    
+    # Send as file if too long
+    if len(msg) > 4000:
+        await message.reply_document(
+            document=BytesIO(msg.encode()),
+            file_name=f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            caption="📝 Full logs"
+        )
+    else:
+        await message.reply(msg)
+
+# ---------- FLASK FOR RENDER ----------
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health():
+    return "🤖 YouTube Cookie Bot with Logging is running!", 200
+
+@flask_app.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port)
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    # Start Flask thread
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
+    print("=" * 60)
+    print("🤖 YOUTUBE COOKIE BOT - SUPER PRO VERSION")
+    print("=" * 60)
+    print(f"👑 Owner ID: {OWNER_ID}")
+    print(f"📝 Log Channel ID: {LOG_CHANNEL_ID}")
+    print(f"🛡️ Admins: {ADMIN_IDS if ADMIN_IDS else 'None'}")
+    print(f"🌐 Port: {os.environ.get('PORT', 8080)}")
+    print(f"💾 MongoDB: Connected")
+    print("=" * 60)
+    print("✅ Features Enabled:")
+    print("   • Real YouTube Cookies")
+    print("   • 2FA Support")
+    print("   • Premium System")
+    print("   • Complete Logging")
+    print("   • Backup in Log Channel")
+    print("=" * 60)
+    
+    app.run()
