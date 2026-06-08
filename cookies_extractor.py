@@ -5,7 +5,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.chrome.service import Service
 
 class YouTubeCookieExtractor:
     def __init__(self):
@@ -13,48 +13,63 @@ class YouTubeCookieExtractor:
         self.wait = None
         
     def setup_driver(self):
-        """Setup Chrome driver for headless operation"""
+        """Setup Chrome driver for Render"""
         chrome_options = Options()
         
-        # Essential for Render
+        # Critical for Render
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-software-rasterizer')
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # User agent to avoid detection
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        # User agent
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
-        # Performance options
-        chrome_options.add_argument('--disable-logging')
-        chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument('--silent')
+        # Find Chrome binary path
+        chrome_paths = [
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable'
+        ]
         
+        chrome_bin = None
+        for path in chrome_paths:
+            if os.path.exists(path):
+                chrome_bin = path
+                break
+        
+        if chrome_bin:
+            chrome_options.binary_location = chrome_bin
+            print(f"✅ Chrome found at: {chrome_bin}")
+        else:
+            print("⚠️ Chrome not found, trying default")
+        
+        # Setup service
         try:
             self.driver = webdriver.Chrome(options=chrome_options)
             self.wait = WebDriverWait(self.driver, 30)
+            print("✅ Chrome driver started successfully")
             return True
         except Exception as e:
-            print(f"Chrome setup error: {e}")
+            print(f"❌ Chrome setup error: {e}")
             return False
     
+    # Rest of the methods remain same...
     def login_to_google(self, email, password):
-        """Login to Google account"""
         try:
-            # Go to Gmail login
-            self.driver.get("https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin")
-            time.sleep(2)
+            self.driver.get("https://accounts.google.com/signin/v2/identifier")
+            time.sleep(3)
             
-            # Enter email
             email_input = self.wait.until(EC.presence_of_element_located((By.ID, "identifierId")))
             email_input.send_keys(email)
             email_input.submit()
             time.sleep(2)
             
-            # Enter password
             password_input = self.wait.until(EC.presence_of_element_located((By.NAME, "Passwd")))
             password_input.send_keys(password)
             password_input.submit()
@@ -66,55 +81,41 @@ class YouTubeCookieExtractor:
             return False
     
     def check_2fa_required(self):
-        """Check if 2FA is required"""
         try:
-            # Check for 2FA input field
             twofa_input = self.driver.find_elements(By.ID, "totpPin")
             if twofa_input:
                 return True
-            
-            # Check for other 2FA indicators
-            twofa_text = self.driver.find_elements(By.XPATH, "//*[contains(text(), '2-Step Verification')]")
-            if twofa_text:
-                return True
-                
             return False
         except:
             return False
     
     def submit_2fa_code(self, code):
-        """Submit 2FA verification code"""
         try:
-            # Find 2FA input field
             twofa_input = self.wait.until(EC.presence_of_element_located((By.ID, "totpPin")))
             twofa_input.send_keys(code)
-            
-            # Submit
             submit_btn = self.driver.find_element(By.ID, "idvNext")
             submit_btn.click()
             time.sleep(3)
-            
             return True
         except Exception as e:
             print(f"2FA error: {e}")
             return False
     
     def goto_youtube(self):
-        """Navigate to YouTube to get cookies"""
         try:
             self.driver.get("https://www.youtube.com")
-            time.sleep(3)
+            time.sleep(5)
             return True
-        except:
+        except Exception as e:
+            print(f"YouTube error: {e}")
             return False
     
     def extract_cookies_netscape(self):
-        """Extract cookies in Netscape format"""
         cookies = self.driver.get_cookies()
         
         netscape = "# Netscape HTTP Cookie File\n"
-        netscape = "# https://curl.se/docs/http-cookies.html\n"
-        netscape = "# This file was generated by YouTube Cookie Bot\n\n"
+        netscape += "# https://curl.se/docs/http-cookies.html\n"
+        netscape += "# Generated by YouTube Cookie Bot\n\n"
         
         for cookie in cookies:
             domain = cookie['domain']
@@ -133,31 +134,31 @@ class YouTubeCookieExtractor:
         return netscape
     
     def extract(self, email, password, twofa_code=None):
-        """Main extraction method"""
+        print("🔧 Setting up driver...")
         if not self.setup_driver():
-            return {"status": "error", "message": "Failed to setup browser"}
+            return {"status": "error", "message": "Browser setup failed"}
         
-        # Login
+        print("🔐 Logging in...")
         if not self.login_to_google(email, password):
             self.driver.quit()
             return {"status": "error", "message": "Login failed. Check email/password"}
         
-        # Check for 2FA
         if self.check_2fa_required():
             if not twofa_code:
                 self.driver.quit()
                 return {"status": "2fa_required", "message": "2FA code needed"}
             
+            print("🔢 Submitting 2FA...")
             if not self.submit_2fa_code(twofa_code):
                 self.driver.quit()
                 return {"status": "error", "message": "Invalid 2FA code"}
         
-        # Go to YouTube
+        print("📺 Going to YouTube...")
         if not self.goto_youtube():
             self.driver.quit()
             return {"status": "error", "message": "Failed to access YouTube"}
         
-        # Extract cookies
+        print("🍪 Extracting cookies...")
         cookies = self.extract_cookies_netscape()
         self.driver.quit()
         
