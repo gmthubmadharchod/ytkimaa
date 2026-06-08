@@ -42,6 +42,20 @@ if not plans_col.find_one():
 if not upi_col.find_one():
     upi_col.insert_one({"upi_id": "owner@okhdfcbank", "qr": None})
 
+# ⭐ IMPORTANT: Auto-add owner and admins to authorized users
+def setup_authorized_users():
+    """Auto add owner and admins to database"""
+    # Add owner
+    if not users_col.find_one({"_id": OWNER_ID}):
+        users_col.insert_one({"_id": OWNER_ID, "daily_count": 0, "role": "owner"})
+        print(f"✅ Owner {OWNER_ID} added to authorized users")
+    
+    # Add admins
+    for admin_id in ADMIN_IDS:
+        if not users_col.find_one({"_id": admin_id}):
+            users_col.insert_one({"_id": admin_id, "daily_count": 0, "role": "admin"})
+            print(f"✅ Admin {admin_id} added to authorized users")
+
 # ---------- BOT INIT ----------
 app = Client("yt_cookie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -84,6 +98,15 @@ async def start_command(client, message):
         [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
     ])
     
+    # Show owner menu if user is owner
+    if is_owner(user_id):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
+            [InlineKeyboardButton("💎 Premium Plans", callback_data="plans")],
+            [InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")],
+            [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+        ])
+    
     await message.reply(
         "🍪 **YouTube Cookie Extractor Bot**\n\n"
         "I can extract YouTube cookies using your Gmail login.\n"
@@ -103,7 +126,34 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
     
-    if data == "get_cookies":
+    if data == "owner_panel" and is_owner(user_id):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Stats", callback_data="stats")],
+            [InlineKeyboardButton("👥 Users List", callback_data="users_list")],
+            [InlineKeyboardButton("💰 Plans", callback_data="owner_plans")],
+            [InlineKeyboardButton("💳 Set UPI", callback_data="set_upi")],
+            [InlineKeyboardButton("➕ Add User", callback_data="add_user")],
+            [InlineKeyboardButton("🏠 Back", callback_data="home")]
+        ])
+        await callback_query.message.edit_text("👑 **Owner Panel**", reply_markup=keyboard)
+    
+    elif data == "stats":
+        total_users = users_col.count_documents({})
+        premium_users = premium_col.count_documents({})
+        await callback_query.message.edit_text(
+            f"📊 **Bot Statistics**\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n💳 UPI: {upi_col.find_one()['upi_id']}"
+        )
+    
+    elif data == "users_list":
+        users = list(users_col.find())
+        msg = "👥 **Users List**\n\n"
+        for user in users[:20]:  # Show first 20
+            role = user.get("role", "user")
+            emoji = "👑" if role == "owner" else "🛡️" if role == "admin" else "👤"
+            msg += f"{emoji} `{user['_id']}`\n"
+        await callback_query.message.edit_text(msg)
+    
+    elif data == "get_cookies":
         if not is_premium(user_id):
             user_data = users_col.find_one({"_id": user_id})
             daily_limit = user_data.get("daily_count", 0) if user_data else 0
@@ -267,6 +317,9 @@ async def handle_login_input(client, message):
 async def confirm_payment(client, message):
     user_id = message.from_user.id
     
+    if not is_authorized(user_id):
+        return
+    
     if not message.reply_to_message:
         await message.reply("❌ Send screenshot as reply to /confirm command")
         return
@@ -284,43 +337,12 @@ async def confirm_payment(client, message):
     await message.reply("✅ Payment screenshot sent to owner. Will be activated soon!")
 
 # ---------- OWNER COMMANDS ----------
-@app.on_message(filters.command("activate") & filters.user(OWNER_ID))
-async def activate_premium(client, message):
-    try:
-        args = message.text.split()
-        user_id = int(args[1])
-        days = int(args[2]) if len(args) > 2 else 30
-        
-        expiry = datetime.now() + timedelta(days=days)
-        premium_col.update_one(
-            {"_id": user_id},
-            {"$set": {"expiry": expiry.timestamp(), "activated_by": OWNER_ID}},
-            upsert=True
-        )
-        
-        await message.reply(f"✅ Premium activated for {user_id} for {days} days")
-        await client.send_message(user_id, f"🎉 Premium activated for {days} days! Enjoy unlimited access.")
-    except:
-        await message.reply("❌ Usage: /activate <user_id> [days]")
-
-@app.on_message(filters.command("users") & filters.user(OWNER_ID))
-async def list_all_users(client, message):
-    users = list(users_col.find())
-    premium_users = list(premium_col.find())
-    
-    msg = f"👥 **Users**\nTotal: {len(users)}\nPremium: {len(premium_users)}\n\n"
-    for user in users:
-        is_prem = "⭐" if premium_col.find_one({"_id": user["_id"]}) else "👤"
-        msg += f"{is_prem} `{user['_id']}`\n"
-    
-    await message.reply(msg)
-
 @app.on_message(filters.command("adduser") & filters.user(OWNER_ID))
 async def add_new_user(client, message):
     try:
         user_id = int(message.text.split()[1])
         if not users_col.find_one({"_id": user_id}):
-            users_col.insert_one({"_id": user_id, "daily_count": 0})
+            users_col.insert_one({"_id": user_id, "daily_count": 0, "role": "user"})
             await message.reply(f"✅ User {user_id} added")
         else:
             await message.reply(f"⚠️ User {user_id} already exists")
@@ -368,15 +390,6 @@ async def set_plan(client, message):
     except:
         await message.reply("❌ Usage: /setplan <name> <price> <days>")
 
-@app.on_message(filters.command("delplan") & filters.user(OWNER_ID))
-async def delete_plan(client, message):
-    try:
-        plan_id = message.text.split()[1].lower()
-        plans_col.delete_one({"id": plan_id})
-        await message.reply(f"✅ Plan {plan_id} deleted")
-    except:
-        await message.reply("❌ Usage: /delplan <plan_id>")
-
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def bot_stats(client, message):
     total_users = users_col.count_documents({})
@@ -384,10 +397,10 @@ async def bot_stats(client, message):
     active_sessions = sessions_col.count_documents({})
     
     await message.reply(
-        f"📊 *Bot Statistics*\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n🔄 Active Sessions: {active_sessions}\n💰 Plans Available: {plans_col.count_documents({})}\n💳 UPI Configured: {upi_col.find_one()['upi_id'] if upi_col.find_one() else 'None'}"
+        f"📊 *Bot Statistics*\n\n👥 Total Users: {total_users}\n⭐ Premium Users: {premium_users}\n🔄 Active Sessions: {active_sessions}\n💰 Plans Available: {plans_col.count_documents({})}\n💳 UPI: {upi_col.find_one()['upi_id'] if upi_col.find_one() else 'None'}"
     )
 
-# ---------- FLASK APP FOR PORT BINDING (RENDER) ----------
+# ---------- FLASK APP FOR PORT BINDING ----------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -404,11 +417,16 @@ def run_flask():
 
 # ---------- RUN ----------
 if __name__ == "__main__":
+    # Auto setup authorized users (owner + admins)
+    setup_authorized_users()
+    
+    # Start Flask thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
     print("🤖 Bot Started Successfully!")
-    print(f"Owner ID: {OWNER_ID}")
-    print(f"Admins: {ADMIN_IDS}")
-    print(f"Port: {os.environ.get('PORT', 8080)}")
+    print(f"👑 Owner ID: {OWNER_ID}")
+    print(f"🛡️ Admins: {ADMIN_IDS}")
+    print(f"🌐 Port: {os.environ.get('PORT', 8080)}")
+    
     app.run()
