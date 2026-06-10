@@ -4,7 +4,6 @@ pymongo==4.5.0
 python-dotenv==1.0.0
 selenium==4.15.0
 webdriver-manager==4.0.1
-aiohttp==3.9.0
 qrcode==7.4.2
 pillow==10.1.0
 Flask==2.3.3
